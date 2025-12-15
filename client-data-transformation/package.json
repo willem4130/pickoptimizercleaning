@@ -1,0 +1,21 @@
+{
+  "name": "bidfood-data-transformation",
+  "version": "1.0.0",
+  "description": "Transform Bidfood client CSV data to warehouse optimizer template format",
+  "private": true,
+  "scripts": {
+    "transform": "tsx scripts/transform-bay-level.ts",
+    "transform:old": "tsx scripts/transform-client-data.ts",
+    "analyze": "tsx scripts/analyze-bay-patterns.ts",
+    "validate": "tsx scripts/validate-referential-integrity.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
