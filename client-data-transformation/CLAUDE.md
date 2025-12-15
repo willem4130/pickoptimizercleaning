@@ -1,124 +1,199 @@
 # Bidfood Warehouse Data Transformation
 
-Transforms Bidfood warehouse CSV files (locations, articles, picks) into standardized Excel format for warehouse optimization simulation tools.
+Transforms warehouse CSV → Excel (Pick, Location, ArticleLocation sheets) for simulation tools.
 
-## CRITICAL ARCHITECTURE UNDERSTANDING
+## CRITICAL: Slot Allocation Architecture
 
-**This is a SLOT ALLOCATION problem, NOT a volume calculation!**
+**NOT volume calculation - this is bin packing with capacity constraints!**
 
-- `capacityLayout` = **LIST OF INDIVIDUAL PICK LOCATION SIZES** (e.g., "0,25-0,25-0,50-1,00-1,00")
-- Each value represents ONE physical slot in the bay
-- ArticleLocation = slot assignments (each article consumes exactly one slot)
-- **Constraint**: Cannot assign more articles per size than available slots of that size
+- `capacityLayout` = list of slot sizes: "0,25-0,25-0,50-1,00-1,00" (5 physical slots)
+- Each article consumes exactly ONE slot
+- Constraint: `assigned[bay][size] ≤ available[bay][size]`
+- Overflow logged when bay full
 
-## Project Structure
-
-```
-client-data-transformation/
-├── src/                          # Core transformation modules
-│   ├── bay-level-transform.ts    # Bay-level aggregation & capacity calculation
-│   ├── client-to-template.ts     # Legacy template conversion
-│   └── slot-dimensions.ts        # Slot type dimensions & volume calculations
-├── scripts/                      # Executable transformation scripts
-│   ├── transform-bay-level.ts            # Main transformation (Area='D' bays)
-│   ├── analyze-bay-patterns.ts           # Bay pattern analysis
-│   └── validate-referential-integrity.ts # Data integrity validation
-├── output/                       # Generated Excel files
-│   ├── 01_Ready_For_Import/      # Processed files ready for import
-│   ├── 02_Archived/              # Previous transformations
-│   └── 03_Analysis_Reports/      # Analysis outputs
-└── ../Example of input data from client/  # Raw CSV input files
-    ├── Locations.csv             # 4,824 warehouse locations (Area='D' only: 3,394)
-    ├── Artikelinformatie.csv     # 3,006 articles with dimensions
-    └── 251209_pick.csv           # 512K picks (filters to ~390K Area='D')
-```
-
-## Key Transformation Logic
-
-**Input** → **Output** (3 Excel sheets):
-1. **Pick Sheet**: Most recent 100K picks from Area='D' locations
-2. **Location Sheet**: Bays with capacityLayout = list of individual slot sizes
-3. **ArticleLocation Sheet**: Slot assignments (respects capacity constraints)
-
-**Critical Requirements**:
-- ✅ Filter locations to Area='D' (starts with 'D')
-- ✅ Filter picks to Area='D' locations only
-- ✅ Sort picks by date DESC (most recent first)
-- ✅ **SLOT ALLOCATION**: Each article consumes one slot from capacityLayout
-- ✅ **CAPACITY CONSTRAINT**: Articles per size ≤ available slots per size
-- ✅ Overflow articles logged when bay is full
-
-**Example**:
-- Bay "11-021" has capacityLayout: "0,25-0,25-0,50-1,00-1,00"
-- This means: 2 slots (0.25), 1 slot (0.50), 2 slots (1.00) = 5 total
-- Can assign: AT MOST 2 articles with locationSize=0.25, 1 with 0.50, 2 with 1.00
-
-## Organization Rules
-
-**Module Separation**:
-- Core logic → `src/` (imported by scripts)
-- Executable scripts → `scripts/` (run via npm)
-- Type definitions → Co-located with usage
-- Outputs → `output/` with organized subdirectories
-
-**File Responsibilities**:
-- `bay-level-transform.ts` - Bay grouping, capacity calculation, location mapping
-- `slot-dimensions.ts` - Slot dimensions, volume calculations, article fitting
-- `transform-bay-level.ts` - Main transformation orchestration
-- `validate-referential-integrity.ts` - 8-check validation suite
-
-## Code Quality - Zero Tolerance
-
-After editing ANY file, run:
+## Commands
 
 ```bash
-npm run typecheck  # TypeScript type checking (strict mode)
+npm run typecheck   # MUST pass before any commit
+npm run transform   # Generate Excel (100K most recent picks)
+npm run validate    # Expect 0 errors, 2 warnings (overflow = expected)
 ```
 
-Fix ALL errors before continuing.
+## Expected Output
 
-After transformation changes:
-
-```bash
-npm run transform  # Generate output Excel file
-npm run validate   # Verify referential integrity (expect 0 errors)
+```
+Picks: 100,000 (most recent from 512K, sorted DESC by date)
+Bays: 324
+Total slots: 3,394 (1,572×1.00 + 1,230×0.50 + 592×0.25)
+ArticleLocation: ~1,500 assignments (44-45% utilization)
+Overflow: ~6,500 articles (capacity exceeded)
+Validation: 0 errors
 ```
 
-Expected output:
-- ~390K picks (Area='D' locations)
-- 324 bays
-- ArticleLocation >= unique articles in picks
-- 0 validation errors
+## Core Implementation
 
-## Key Algorithms
+### 1. Capacity Layout (`src/bay-level-transform.ts`)
 
-**Capacity Layout** (bay-level-transform.ts):
 ```typescript
-// For each bay, list INDIVIDUAL slot sizes (NOT volume percentages)
-capacityLayout = locations
-  .map(loc => getLocationSize(loc['Slot Type'])) // 0.25, 0.50, or 1.00
-  .map(size => size.toFixed(2).replace('.', ','))
-  .join('-')
-// Result: "0,25-0,25-0,50-1,00-1,00" (5 slots total)
+export function calculateBayCapacityLayout(locations: ClientLocation[]): string {
+  // Map each location to its slot size (0.25, 0.50, 1.00)
+  const slotSizes = locations.map(loc =>
+    getLocationSize(loc['Slot Type'] || 'UNKNOWN')
+  );
+
+  // Format: European decimals (comma separator)
+  return slotSizes
+    .map(size => size.toFixed(2).replace('.', ','))
+    .join('-');
+}
 ```
 
-**Slot Allocation Algorithm** (transform-bay-level.ts):
+**Result**: `"0,25-0,25-0,50-1,00-1,00"` = 5 slots in bay
+
+### 2. Slot Allocation (`scripts/transform-bay-level.ts`)
+
 ```typescript
-1. Sort picks by date DESC (most recent first)
-2. Extract most recent 100K picks
-3. For each pick:
-   - Get article, bay, and pick location's slot size
-   - Check if slot available: used[bay][size] < available[bay][size]
-   - If yes: assign article to slot, increment usage
-   - If no: log overflow (bay full)
-4. Report: total slots, used slots, overflow count
+// Step 1: Parse and sort picks (newest first)
+const parseDateFromPick = (dateStr: string): Date => {
+  const parts = dateStr.split(' ')[0]?.split('-') || [];
+  if (parts.length === 3) {
+    const [day, month, year] = parts;
+    const fullYear = year.length === 2 ? '20' + year : year;
+    return new Date(parseInt(fullYear, 10), parseInt(month, 10) - 1, parseInt(day, 10));
+  }
+  return new Date(0);
+};
+
+picksAreaD.sort((a, b) => {
+  const dateA = parseDateFromPick(a['Pick datumtijd'] || a['Leverdatum'] || '');
+  const dateB = parseDateFromPick(b['Pick datumtijd'] || b['Leverdatum'] || '');
+  return dateB.getTime() - dateA.getTime(); // DESC
+});
+
+const picks = picksAreaD.slice(0, 100000); // Most recent 100K
+
+// Step 2: Build slot inventory per bay
+const baySlotInventory = new Map<string, Map<number, number>>();
+bayLocations.forEach((locs, bayCode) => {
+  const inventory = new Map([[0.25, 0], [0.50, 0], [1.00, 0]]);
+  locs.forEach(loc => {
+    const size = getLocationSize(loc['Slot Type'] || 'UNKNOWN');
+    inventory.set(size, (inventory.get(size) || 0) + 1);
+  });
+  baySlotInventory.set(bayCode, inventory);
+});
+
+// Step 3: Allocate articles to slots (FIFO by pick date)
+const slotUsage = new Map<string, Map<number, number>>();
+const assignedPairs = new Set<string>();
+const overflowLog = [];
+
+picks.forEach(pick => {
+  const article = parseInt(pick.Artikelnummer, 10);
+  const mapping = locationMapping.get(pick.Locatiecode?.trim());
+  if (!mapping || isNaN(article)) return;
+
+  const bayCode = mapping.bayLocation;
+  const slotSize = getLocationSize(mapping.slotType);
+  const pairKey = `${article}-${bayCode}`;
+
+  if (assignedPairs.has(pairKey)) return; // Already assigned
+
+  const available = baySlotInventory.get(bayCode)?.get(slotSize) || 0;
+  const used = slotUsage.get(bayCode)?.get(slotSize) || 0;
+
+  if (used < available) {
+    // Assign article → slot
+    articleLocationSheet.push({ article, location: bayCode, locationSize: slotSize, ... });
+    slotUsage.get(bayCode)!.set(slotSize, used + 1);
+    assignedPairs.add(pairKey);
+  } else {
+    // Overflow: bay full
+    overflowLog.push({ article, bay: bayCode, size: slotSize, ... });
+  }
+});
 ```
 
-**Slot Inventory Tracking**:
-- Build: `availableSlots[bay][size] = count of slots per size`
-- Track: `slotUsage[bay][size] = count of assigned articles`
-- Constraint: `slotUsage[bay][size] ≤ availableSlots[bay][size]`
+### 3. Slot Size Mapping (`src/slot-dimensions.ts`)
 
-**Area Filtering**:
-- Locations: Filter to `Area === 'D'` (3,394 from 4,824)
-- Picks: Filter to `Locatiecode.startsWith('D')` (all 512K are Area='D')
+```typescript
+// Slot types → location sizes
+BLH, BLN: 1.0 (large pallet)
+BLL, PP5: 0.5 (medium)
+PP3, PP7, PP9, PK, PLK, PLV: 0.25 (small shelf)
+UNKNOWN: 1.0 (default)
+
+export function getLocationSize(slotType: string): 0.25 | 0.5 | 1.0 {
+  const dimensions = SLOT_DIMENSIONS[slotType];
+  return dimensions?.locationSize || 1.0;
+}
+```
+
+### 4. Validation (`scripts/validate-referential-integrity.ts`)
+
+**9 Checks** (must all pass):
+1. ✅ Pick.location → Location.location
+2. ⚠️ Pick.article → ArticleLocation (overflow expected)
+3. ✅ ArticleLocation.location → Location
+4. ⚠️ Article-location pairs (overflow expected)
+5. ✅ **capacityLayout values ∈ {0.25, 0.50, 1.00}**
+6. ✅ locationSize values valid
+7. ✅ No duplicate keys
+8. ✅ originalPickLocation references valid
+9. ✅ **Capacity constraints: assigned ≤ available**
+
+```typescript
+// Check 5: Validate slot sizes
+const invalidValues = locations.filter(loc => {
+  const capacities = loc.capacityLayout.split('-')
+    .map(c => parseFloat(c.replace(',', '.')));
+  return capacities.some(c => ![0.25, 0.50, 0.5, 1.00, 1.0].includes(c));
+});
+
+// Check 9: Validate capacity constraints
+locations.forEach(loc => {
+  const availableSlots = countSlotsFromCapacityLayout(loc.capacityLayout);
+  const assignedSlots = countArticlesFromArticleLocation(loc.location);
+
+  [0.25, 0.50, 1.00].forEach(size => {
+    if (assignedSlots[size] > availableSlots[size]) {
+      errors.push(`${loc.location}: ${assignedSlots[size]} > ${availableSlots[size]}`);
+    }
+  });
+});
+```
+
+## Data Flow
+
+```
+Locations.csv (4,824)
+  → Filter Area='D' (3,394)
+  → Group by bay (324)
+  → Calculate capacityLayout per bay
+
+251209_pick.csv (512,922)
+  → Filter Area='D' (512,922)
+  → Sort DESC by date
+  → Take 100K most recent
+  → Allocate to slots (FIFO)
+  → ArticleLocation (1,524) + Overflow (6,586)
+```
+
+## File Structure
+
+```
+src/
+  bay-level-transform.ts    # calculateBayCapacityLayout, aggregatePicksToBayLevel
+  slot-dimensions.ts        # getLocationSize, SLOT_DIMENSIONS map
+scripts/
+  transform-bay-level.ts    # Main: sort picks, build inventory, allocate slots
+  validate-referential-integrity.ts  # 9 validation checks
+```
+
+## Critical Rules
+
+1. **Never calculate volume percentages** - only list slot sizes
+2. **Always sort picks DESC by date** - newest = best data quality
+3. **Respect capacity constraints** - stop at available slots, log overflow
+4. **Trust operational data** - use pick location's slot size (not article dimensions)
+5. **European decimals** - use comma (0,25) not period (0.25) in output
